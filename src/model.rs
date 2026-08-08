@@ -24,6 +24,9 @@ pub struct StaticModel {
     normalize: bool,
     median_token_length: usize,
     unk_token_id: Option<usize>,
+    /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
+    /// pipelines, which fall back to the `tokenizers` crate.
+    fast_tok: Option<crate::fast_wordpiece::FastWordPiece>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +264,7 @@ impl StaticModel {
             ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+        let fast_tok = crate::fast_wordpiece::FastWordPiece::from_tokenizer(&tokenizer);
         let embeddings =
             Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
         Ok(Self {
@@ -271,6 +275,7 @@ impl StaticModel {
             normalize,
             median_token_length,
             unk_token_id,
+            fast_tok,
         })
     }
 
@@ -303,6 +308,7 @@ impl StaticModel {
             ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+        let fast_tok = crate::fast_wordpiece::FastWordPiece::from_tokenizer(&tokenizer);
         let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
         Ok(Self {
             tokenizer,
@@ -312,6 +318,7 @@ impl StaticModel {
             normalize,
             median_token_length,
             unk_token_id,
+            fast_tok,
         })
     }
 
@@ -367,12 +374,7 @@ impl StaticModel {
                         .unwrap_or(text.as_str())
                 })
                 .collect();
-            let encodings = self
-                .tokenizer
-                .encode_batch_fast::<String>(truncated.into_iter().map(Into::into).collect(), false)
-                .expect("tokenization failed");
-            for encoding in encodings {
-                let mut token_ids = encoding.get_ids().to_vec();
+            for mut token_ids in self.tokenize_batch_ids(&truncated) {
                 if let Some(unk_id) = self.unk_token_id {
                     token_ids.retain(|&id| id as usize != unk_id);
                 }
@@ -383,6 +385,23 @@ impl StaticModel {
             }
         }
         embeddings
+    }
+
+    /// Tokenize a batch to raw ID lists (before UNK filtering / truncation).
+    /// Uses the custom WordPiece tokenizer when the model matches that
+    /// pipeline; non-WordPiece pipelines (e.g. the Unigram/multilingual
+    /// model) keep the crate's tokenizer by design — see optimisations.md,
+    /// H1 scope decision.
+    fn tokenize_batch_ids(&self, texts: &[&str]) -> Vec<Vec<u32>> {
+        if let Some(ft) = &self.fast_tok {
+            return texts.iter().map(|t| ft.encode_ids(t)).collect();
+        }
+        self.tokenizer
+            .encode_batch_fast::<String>(texts.iter().map(|s| (*s).to_string()).collect(), false)
+            .expect("tokenization failed")
+            .into_iter()
+            .map(|e| e.get_ids().to_vec())
+            .collect()
     }
 
     /// Default encode: `max_length=512`, `batch_size=1024`
@@ -398,27 +417,13 @@ impl StaticModel {
             .unwrap_or_default()
     }
 
-    /// Mean-pool a token-ID list into a single vector.
+    /// Mean-pool a token-ID list into a single vector. Every id contributes
+    /// exactly one row, so the mean divisor is `ids.len()`.
     fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
         let dim = self.embeddings.ncols();
         let mut sum = vec![0.0_f32; dim];
-        let mut cnt = 0usize;
-        for &id in &ids {
-            let tok = id as usize;
-            let row_idx = self
-                .token_mapping
-                .as_ref()
-                .and_then(|m| m.get(tok))
-                .copied()
-                .unwrap_or(tok);
-            let scale = self.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
-            let row = self.embeddings.row(row_idx);
-            for (s, &v) in sum.iter_mut().zip(row.iter()) {
-                *s += v * scale;
-            }
-            cnt += 1;
-        }
-        let denom = cnt.max(1) as f32;
+        self.accumulate_rows(&ids, &mut sum);
+        let denom = ids.len().max(1) as f32;
         for x in &mut sum {
             *x /= denom;
         }
@@ -429,6 +434,32 @@ impl StaticModel {
             }
         }
         sum
+    }
+
+    /// Accumulate embedding rows for `ids` into `sum`. Indexes the
+    /// contiguous row-major backing slice directly rather than `ndarray`'s
+    /// row view, which blocks autovectorization (see optimisations.md, H4).
+    #[inline]
+    fn accumulate_rows(&self, ids: &[u32], sum: &mut [f32]) {
+        let dim = sum.len();
+        let flat = self
+            .embeddings
+            .as_slice()
+            .expect("embeddings must be contiguous row-major");
+        for &id in ids {
+            let tok = id as usize;
+            let row_idx = self
+                .token_mapping
+                .as_ref()
+                .and_then(|m| m.get(tok))
+                .copied()
+                .unwrap_or(tok);
+            let scale = self.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
+            let row = &flat[row_idx * dim..row_idx * dim + dim];
+            for (s, &v) in sum.iter_mut().zip(row.iter()) {
+                *s += v * scale;
+            }
+        }
     }
 }
 
