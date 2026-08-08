@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
+mod fast_wordpiece;
 mod model;
 use model::StaticModel;
 
