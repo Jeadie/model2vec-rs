@@ -17,6 +17,9 @@ pub struct StaticModel {
     normalize: bool,
     median_token_length: usize,
     unk_token_id: Option<usize>,
+    /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
+    /// pipelines, which fall back to the `tokenizers` crate.
+    fast_tok: Option<crate::fast_wordpiece::FastWordPiece>,
 }
 
 impl StaticModel {
@@ -128,12 +131,17 @@ impl StaticModel {
         };
         let embeddings = Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
 
+        // Opt-in fast path: `Some` only for the WordPiece pipeline the potion
+        // models ship, `None` (crate fallback) for anything else.
+        let fast_tok = crate::fast_wordpiece::FastWordPiece::from_tokenizer(&tokenizer);
+
         Ok(Self {
             tokenizer,
             embeddings,
             normalize,
             median_token_length,
             unk_token_id: Some(unk_token_id),
+            fast_tok,
         })
     }
 
@@ -172,19 +180,8 @@ impl StaticModel {
                 })
                 .collect();
 
-            // Tokenize the batch
-            let encodings = self
-                .tokenizer
-                .encode_batch_fast::<String>(
-                    // Into<EncodeInput>
-                    truncated.into_iter().map(Into::into).collect(),
-                    /* add_special_tokens = */ false,
-                )
-                .expect("tokenization failed");
-
-            // Pool each token-ID list into a single mean vector
-            for encoding in encodings {
-                let mut token_ids = encoding.get_ids().to_vec();
+            // Tokenize the batch, then pool each token-ID list into a mean vector
+            for mut token_ids in self.tokenize_batch_ids(&truncated) {
                 // Remove unk tokens if specified
                 if let Some(unk_id) = self.unk_token_id {
                     token_ids.retain(|&id| id as usize != unk_id);
@@ -200,6 +197,22 @@ impl StaticModel {
         embeddings
     }
 
+    /// Tokenize a batch to raw ID lists (before UNK filtering / truncation).
+    /// Uses the custom WordPiece tokenizer when the model matches that
+    /// pipeline; non-WordPiece pipelines keep the crate's tokenizer, so
+    /// output is unchanged in both cases.
+    fn tokenize_batch_ids(&self, texts: &[&str]) -> Vec<Vec<u32>> {
+        if let Some(ft) = &self.fast_tok {
+            return texts.iter().map(|t| ft.encode_ids(t)).collect();
+        }
+        self.tokenizer
+            .encode_batch_fast::<String>(texts.iter().map(|s| (*s).to_string()).collect(), false)
+            .expect("tokenization failed")
+            .into_iter()
+            .map(|e| e.get_ids().to_vec())
+            .collect()
+    }
+
     /// Default encode: `max_length=512`, `batch_size=1024`
     pub fn encode(&self, sentences: &[String]) -> Vec<Vec<f32>> {
         self.encode_with_args(sentences, Some(512), 1024)
@@ -213,13 +226,21 @@ impl StaticModel {
             .unwrap_or_default()
     }
 
-    /// Mean-pool a single token-ID list into a vector
+    /// Mean-pool a single token-ID list into a vector. Rows are summed over
+    /// the contiguous row-major backing slice directly rather than `ndarray`'s
+    /// row view, which blocks autovectorization.
     fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
-        let mut sum = vec![0.0; self.embeddings.ncols()];
+        let dim = self.embeddings.ncols();
+        let mut sum = vec![0.0; dim];
+        let flat = self
+            .embeddings
+            .as_slice()
+            .expect("embeddings must be contiguous row-major");
         for &id in &ids {
-            let row = self.embeddings.row(id as usize);
-            for (i, &v) in row.iter().enumerate() {
-                sum[i] += v;
+            let start = id as usize * dim;
+            let row = &flat[start..start + dim];
+            for (s, &v) in sum.iter_mut().zip(row.iter()) {
+                *s += v;
             }
         }
         let cnt = ids.len().max(1) as f32;
