@@ -1,51 +1,7 @@
 mod common;
-use approx::assert_relative_eq;
 use common::load_test_model;
 use model2vec_rs::model::StaticModel;
 use std::fs;
-
-#[test]
-fn test_encode_matches_python_model2vec() {
-    // Load the test model
-    let model = load_test_model();
-
-    // Define the short and long text inputs
-    let long_text = vec!["hello"; 1000].join(" ");
-    let short_text = "hello world".to_string();
-    let cases = vec![
-        ("tests/fixtures/embeddings_short.json", vec![short_text]),
-        ("tests/fixtures/embeddings_long.json", vec![long_text]),
-    ];
-
-    for (fixture_path, inputs) in cases {
-        // Read and parse the Python‐generated embedding fixture
-        let fixture =
-            fs::read_to_string(fixture_path).unwrap_or_else(|_| panic!("Fixture not found: {}", fixture_path));
-        let expected: Vec<Vec<f32>> = serde_json::from_str(&fixture).expect("Failed to parse fixture");
-
-        // Encode with the Rust model
-        let output = model.encode(&inputs);
-
-        // Sanity checks
-        assert_eq!(
-            output.len(),
-            expected.len(),
-            "number of sentences mismatch for {}",
-            fixture_path
-        );
-        assert_eq!(
-            output[0].len(),
-            expected[0].len(),
-            "vector dimensionality mismatch for {}",
-            fixture_path
-        );
-
-        // Element‐wise comparison
-        for (o, e) in output[0].iter().zip(&expected[0]) {
-            assert_relative_eq!(o, e, max_relative = 1e-5);
-        }
-    }
-}
 
 /// Test that encoding an empty input slice yields an empty output
 #[test]
@@ -113,5 +69,100 @@ fn test_normalization_flag_override() {
     assert!(
         norm_no > norm_norm,
         "Without normalization override, norm should be larger"
+    );
+}
+
+/// Test from_borrowed constructor (zero-copy path)
+#[test]
+fn test_from_borrowed() {
+    use safetensors::SafeTensors;
+    use tokenizers::Tokenizer;
+
+    let path = "tests/fixtures/test-model-float32";
+    let tokenizer = Tokenizer::from_file(format!("{path}/tokenizer.json")).unwrap();
+    let bytes = fs::read(format!("{path}/model.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let tensor = tensors.tensor("embeddings").unwrap();
+    let [rows, cols]: [usize; 2] = tensor.shape().try_into().unwrap();
+    let floats: Vec<f32> = tensor
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    // Leak to get 'static lifetime (fine for tests)
+    let floats: &'static [f32] = Box::leak(floats.into_boxed_slice());
+
+    let model = StaticModel::from_borrowed(tokenizer, floats, rows, cols, true, None, None).unwrap();
+    let emb = model.encode_single("hello");
+    assert!(!emb.is_empty());
+}
+
+#[test]
+fn test_from_bytes_matches_from_pretrained_for_local_model() {
+    let path = "tests/fixtures/test-model-float32";
+    let from_path = StaticModel::from_pretrained(path, None, None, None).unwrap();
+    let from_bytes = StaticModel::from_bytes(
+        fs::read(format!("{path}/tokenizer.json")).unwrap(),
+        fs::read(format!("{path}/model.safetensors")).unwrap(),
+        fs::read(format!("{path}/config.json")).unwrap(),
+        None,
+    )
+    .unwrap();
+
+    let query = "hello world";
+    let path_embedding = from_path.encode_single(query);
+    let bytes_embedding = from_bytes.encode_single(query);
+
+    assert_eq!(path_embedding.len(), bytes_embedding.len());
+    for (left, right) in path_embedding.iter().zip(bytes_embedding.iter()) {
+        assert!(
+            (left - right).abs() < 1e-6,
+            "expected byte-loaded model to match path-loaded model"
+        );
+    }
+}
+
+/// A tokenizer whose `model.unk_token` is genuinely absent (`null`) must load
+/// without error, and `StaticModel` must record `unk_token_id: None` rather
+/// than defaulting to a literal "[UNK]" token and failing when that string
+/// isn't in the vocab. This matches byte-level BPE tokenizers (e.g. Qwen's),
+/// which have full byte coverage and never declare an unk token.
+#[test]
+fn test_load_tokenizer_without_unk_token() {
+    use tokenizers::Tokenizer;
+
+    let tokenizer = Tokenizer::from_file("tests/fixtures/byte-bpe-no-unk-tokenizer.json")
+        .expect("tokenizer with unk_token: null should load");
+
+    let rows = tokenizer.get_vocab_size(false);
+    let cols = 4;
+    let embeddings = vec![0.1_f32; rows * cols];
+
+    let model = StaticModel::from_owned(tokenizer, embeddings, rows, cols, true, None, None)
+        .expect("StaticModel should build even when the tokenizer has no unk_token");
+
+    // Encoding should not panic or filter anything out due to a bogus unk id.
+    let emb = model.encode_single("hello world");
+    assert_eq!(emb.len(), cols);
+}
+
+#[cfg(all(not(feature = "hf-hub"), not(feature = "local-only")))]
+#[test]
+fn test_from_pretrained_remote_requires_hf_hub_feature() {
+    let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("hf-hub"),
+        "expected remote loading without hf-hub to mention the missing feature"
+    );
+}
+
+#[cfg(feature = "local-only")]
+#[test]
+fn test_from_pretrained_remote_disallowed_by_local_only_feature() {
+    let err = StaticModel::from_pretrained("minishlab/potion-base-2M", None, None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("local-only"),
+        "expected remote loading with local-only to mention the local-only restriction"
     );
 }

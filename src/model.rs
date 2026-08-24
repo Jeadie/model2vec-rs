@@ -1,19 +1,25 @@
 use anyhow::{anyhow, Context, Result};
 use half::f16;
-use hf_hub::api::sync::{Api, ApiBuilder};
-use ndarray::Array2;
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+use hf_hub::api::sync::ApiBuilder;
+use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use safetensors::{tensor::Dtype, SafeTensors};
 use serde_json::Value;
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+use std::borrow::Cow;
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+use std::env;
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+use std::path::PathBuf;
+use std::{fs, path::Path};
 use tokenizers::Tokenizer;
 
 /// Static embedding model for Model2Vec
+#[derive(Debug, Clone)]
 pub struct StaticModel {
     tokenizer: Tokenizer,
-    embeddings: Array2<f32>,
+    embeddings: CowArray<'static, f32, Ix2>,
+    weights: Option<Cow<'static, [f32]>>,
+    token_mapping: Option<Cow<'static, [usize]>>,
     normalize: bool,
     median_token_length: usize,
     unk_token_id: Option<usize>,
@@ -22,90 +28,38 @@ pub struct StaticModel {
     fast_tok: Option<crate::fast_wordpiece::FastWordPiece>,
 }
 
+#[derive(Debug, Clone)]
+struct ModelFiles {
+    tokenizer: std::path::PathBuf,
+    model: std::path::PathBuf,
+    config: std::path::PathBuf,
+}
+
 impl StaticModel {
-    /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
+    /// Load a Model2Vec model directly from in-memory bytes.
     ///
-    /// # Arguments
-    /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
-    /// * `token` - Optional HuggingFace token for authenticated downloads.
-    /// * `normalize` - Optional flag to normalize embeddings (default from config.json).
-    /// * `subfolder` - Optional subfolder within the repo or path to look for model files.
-    pub fn from_pretrained<P: AsRef<Path>>(
-        repo_or_path: P,
-        token: Option<&str>,
+    /// This path is useful for runtimes that fetch model assets as bytes
+    /// rather than reading them from a local filesystem.
+    pub fn from_bytes<T, M, C>(
+        tokenizer_bytes: T,
+        model_bytes: M,
+        config_bytes: C,
         normalize: Option<bool>,
-        subfolder: Option<&str>,
-    ) -> Result<Self> {
-        // If provided, set HF token for authenticated downloads
-        if let Some(tok) = token {
-            env::set_var("HF_HUB_TOKEN", tok);
-        }
+    ) -> Result<Self>
+    where
+        T: AsRef<[u8]>,
+        M: AsRef<[u8]>,
+        C: AsRef<[u8]>,
+    {
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
-        // Locate tokenizer.json, model.safetensors, and optionally config.json
-        let (tok_path, mdl_path, cfg_path) = {
-            let base = repo_or_path.as_ref();
-            if base.exists() {
-                let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
-                let t = folder.join("tokenizer.json");
-                let m = folder.join("model.safetensors");
-                if !t.exists() || !m.exists() {
-                    return Err(anyhow!("local path {folder:?} missing tokenizer.json or model.safetensors"));
-                }
-                let c = folder.join("config.json");
-                let c = if c.exists() { Some(c) } else { None };
-                (t, m, c)
-            } else {
-                let mut api_builder = ApiBuilder::from_env();
-                if let Some(cache_dir) = env::var_os("HF_HUB_CACHE") {
-                    api_builder = api_builder.with_cache_dir(PathBuf::from(cache_dir));
-                };
-                let api = api_builder.build().context("hf-hub API init failed")?;
-                let repo = api.model(repo_or_path.as_ref().to_string_lossy().into_owned());
-                let prefix = subfolder.map(|s| format!("{}/", s)).unwrap_or_default();
-                let t = repo.get(&format!("{prefix}tokenizer.json"))?;
-                let m = repo.get(&format!("{prefix}model.safetensors"))?;
-                let c = repo.get(&format!("{prefix}config.json")).ok();
-                (t, m, c)
-            }
-        };
-
-        // Load the tokenizer
-        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
-
-        // Median-token-length hack for pre-truncation
-        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
-        lens.sort_unstable();
-        let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
-
-        // Read normalize default from config.json if available, otherwise default to true
-        let cfg_norm = if let Some(cfg_path) = &cfg_path {
-            let cfg_file = std::fs::File::open(cfg_path).context("failed to read config.json")?;
-            let cfg: Value = serde_json::from_reader(&cfg_file).context("failed to parse config.json")?;
-            cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true)
-        } else {
-            log::warn!("config.json not found, defaulting normalize=true");
-            true
-        };
+        // Read normalize default from config.json
+        let cfg: Value = serde_json::from_slice(config_bytes.as_ref()).context("failed to parse config.json")?;
+        let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
         let normalize = normalize.unwrap_or(cfg_norm);
 
-        // Serialize the tokenizer to JSON, then parse it and get the unk_token
-        let spec_json = tokenizer
-            .to_string(false)
-            .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
-        let spec: Value = serde_json::from_str(&spec_json)?;
-        let unk_token = spec
-            .get("model")
-            .and_then(|m| m.get("unk_token"))
-            .and_then(Value::as_str)
-            .unwrap_or("[UNK]");
-        let unk_token_id = tokenizer
-            .token_to_id(unk_token)
-            .ok_or_else(|| anyhow!("tokenizer claims unk_token='{unk_token}' but it isn't in the vocab"))?
-            as usize;
-
         // Load the safetensors
-        let model_bytes = fs::read(&mdl_path).context("failed to read model.safetensors")?;
-        let safet = SafeTensors::deserialize(&model_bytes).context("failed to parse safetensors")?;
+        let safet = SafeTensors::deserialize(model_bytes.as_ref()).context("failed to parse safetensors")?;
         let tensor = safet
             .tensor("embeddings")
             .or_else(|_| safet.tensor("embedding.weight"))
@@ -129,7 +83,99 @@ impl StaticModel {
             Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
-        let embeddings = Array2::from_shape_vec((rows, cols), floats).context("failed to build embeddings array")?;
+
+        // Load optional weights for vocabulary quantization
+        let weights = match safet.tensor("weights") {
+            Ok(t) => {
+                let raw = t.data();
+                let v: Vec<f32> = match t.dtype() {
+                    Dtype::F64 => raw
+                        .chunks_exact(8)
+                        .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+                        .collect(),
+                    Dtype::F32 => raw
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                        .collect(),
+                    Dtype::F16 => raw
+                        .chunks_exact(2)
+                        .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
+                        .collect(),
+                    other => return Err(anyhow!("unsupported weights dtype: {:?}", other)),
+                };
+                Some(v)
+            }
+            Err(_) => None,
+        };
+
+        // Load optional token mapping for vocabulary quantization
+        let token_mapping = match safet.tensor("mapping") {
+            Ok(t) => {
+                let raw = t.data();
+                let v: Vec<usize> = raw
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
+                    .collect();
+                Some(v)
+            }
+            Err(_) => None,
+        };
+
+        Self::from_owned(tokenizer, floats, rows, cols, normalize, weights, token_mapping)
+    }
+
+    /// Load a Model2Vec model from a local folder or the HuggingFace Hub.
+    ///
+    /// # Arguments
+    /// * `repo_or_path` - HuggingFace repo ID or local path to the model folder.
+    /// * `token` - Optional HuggingFace token for authenticated downloads.
+    /// * `normalize` - Optional flag to normalize embeddings (default from config.json).
+    /// * `subfolder` - Optional subfolder within the repo or path to look for model files.
+    pub fn from_pretrained<P: AsRef<Path>>(
+        repo_or_path: P,
+        token: Option<&str>,
+        normalize: Option<bool>,
+        subfolder: Option<&str>,
+    ) -> Result<Self> {
+        let files = resolve_model_files(repo_or_path, token, subfolder)?;
+        let tokenizer_bytes = fs::read(&files.tokenizer).context("failed to read tokenizer.json")?;
+        let model_bytes = fs::read(&files.model).context("failed to read model.safetensors")?;
+        let config_bytes = fs::read(&files.config).context("failed to read config.json")?;
+        Self::from_bytes(tokenizer_bytes, model_bytes, config_bytes, normalize)
+    }
+
+    /// Construct from owned data.
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Owned f32 embedding data
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional per-token weights for quantized models
+    /// * `token_mapping` - Optional token ID mapping for quantized models
+    pub fn from_owned(
+        tokenizer: Tokenizer,
+        embeddings: Vec<f32>,
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<Vec<f32>>,
+        token_mapping: Option<Vec<usize>>,
+    ) -> Result<Self> {
+        if embeddings.len() != rows * cols {
+            return Err(anyhow!(
+                "embeddings length {} != rows {} * cols {}",
+                embeddings.len(),
+                rows,
+                cols
+            ));
+        }
+
+        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+
+        let embeddings =
+            Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
 
         // Opt-in fast path: `Some` only for the WordPiece pipeline the potion
         // models ship, `None` (crate fallback) for anything else.
@@ -137,12 +183,91 @@ impl StaticModel {
 
         Ok(Self {
             tokenizer,
-            embeddings,
+            embeddings: CowArray::from(embeddings),
+            weights: weights.map(Cow::Owned),
+            token_mapping: token_mapping.map(Cow::Owned),
             normalize,
             median_token_length,
-            unk_token_id: Some(unk_token_id),
+            unk_token_id,
             fast_tok,
         })
+    }
+
+    /// Construct from static slices (zero-copy for embedded binary data).
+    ///
+    /// # Arguments
+    /// * `tokenizer` - Pre-deserialized tokenizer
+    /// * `embeddings` - Static f32 embedding data (borrowed, no copy)
+    /// * `rows` - Number of vocabulary entries
+    /// * `cols` - Embedding dimension
+    /// * `normalize` - Whether to L2-normalize output embeddings
+    /// * `weights` - Optional static per-token weights for quantized models
+    /// * `token_mapping` - Optional static token ID mapping for quantized models
+    #[allow(dead_code)] // Public API for external crates
+    pub fn from_borrowed(
+        tokenizer: Tokenizer,
+        embeddings: &'static [f32],
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<&'static [f32]>,
+        token_mapping: Option<&'static [usize]>,
+    ) -> Result<Self> {
+        if embeddings.len() != rows * cols {
+            return Err(anyhow!(
+                "embeddings length {} != rows {} * cols {}",
+                embeddings.len(),
+                rows,
+                cols
+            ));
+        }
+
+        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
+
+        let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
+
+        // Opt-in fast path: `Some` only for the WordPiece pipeline the potion
+        // models ship, `None` (crate fallback) for anything else.
+        let fast_tok = crate::fast_wordpiece::FastWordPiece::from_tokenizer(&tokenizer);
+
+        Ok(Self {
+            tokenizer,
+            embeddings: CowArray::from(embeddings),
+            weights: weights.map(Cow::Borrowed),
+            token_mapping: token_mapping.map(Cow::Borrowed),
+            normalize,
+            median_token_length,
+            unk_token_id,
+            fast_tok,
+        })
+    }
+
+    /// Compute median token length and unk_token_id from tokenizer.
+    fn compute_metadata(tokenizer: &Tokenizer) -> Result<(usize, Option<usize>)> {
+        // Median-token-length hack for pre-truncation
+        let mut lens: Vec<usize> = tokenizer.get_vocab(false).keys().map(|tk| tk.len()).collect();
+        lens.sort_unstable();
+        let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
+
+        // Get unk_token from tokenizer (optional - BPE tokenizers may not have one)
+        let spec_json = tokenizer
+            .to_string(false)
+            .map_err(|e| anyhow!("tokenizer -> JSON failed: {e}"))?;
+        let spec: Value = serde_json::from_str(&spec_json)?;
+        let unk_token = spec
+            .get("model")
+            .and_then(|m| m.get("unk_token"))
+            .and_then(Value::as_str);
+        let unk_token_id = if let Some(tok) = unk_token {
+            let id = tokenizer
+                .token_to_id(tok)
+                .ok_or_else(|| anyhow!("tokenizer declares unk_token='{tok}' but it isn't in the vocab"))?;
+            Some(id as usize)
+        } else {
+            None
+        };
+
+        Ok((median_token_length, unk_token_id))
     }
 
     /// Char-level truncation to max_tokens * median_token_length
@@ -236,19 +361,128 @@ impl StaticModel {
             .embeddings
             .as_slice()
             .expect("embeddings must be contiguous row-major");
+        let mut cnt = 0usize;
+
         for &id in &ids {
-            let start = id as usize * dim;
+            let tok = id as usize;
+
+            // Remap: row = token_mapping[id] or id
+            let row_idx = if let Some(m) = &self.token_mapping {
+                *m.get(tok).unwrap_or(&tok)
+            } else {
+                tok
+            };
+
+            // Scale by per-token weight if present
+            let scale = if let Some(w) = &self.weights {
+                *w.get(tok).unwrap_or(&1.0)
+            } else {
+                1.0
+            };
+
+            let start = row_idx * dim;
             let row = &flat[start..start + dim];
             for (s, &v) in sum.iter_mut().zip(row.iter()) {
-                *s += v;
+                *s += v * scale;
             }
+            cnt += 1;
         }
-        let cnt = ids.len().max(1) as f32;
-        sum.iter_mut().for_each(|x| *x /= cnt);
+
+        // Mean pool the embeddings
+        let denom = (cnt.max(1)) as f32;
+        for x in &mut sum {
+            *x /= denom;
+        }
+
+        // Normalize the embeddings if required
         if self.normalize {
             let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
-            sum.iter_mut().for_each(|x| *x /= norm);
+            for x in &mut sum {
+                *x /= norm;
+            }
         }
         sum
     }
+}
+
+fn resolve_model_files<P: AsRef<Path>>(
+    repo_or_path: P,
+    token: Option<&str>,
+    subfolder: Option<&str>,
+) -> Result<ModelFiles> {
+    #[cfg(not(feature = "hf-hub"))]
+    let _ = token;
+    #[cfg(feature = "local-only")]
+    let _ = token;
+
+    let (tokenizer, model, config) = {
+        let base = repo_or_path.as_ref();
+        if base.exists() {
+            let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
+            let tokenizer = folder.join("tokenizer.json");
+            let model = folder.join("model.safetensors");
+            let config = folder.join("config.json");
+            if !tokenizer.exists() || !model.exists() || !config.exists() {
+                return Err(anyhow!("local path {folder:?} missing tokenizer / model / config"));
+            }
+            (tokenizer, model, config)
+        } else {
+            #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+            {
+                let files = download_model_files(repo_or_path.as_ref().to_string_lossy().as_ref(), token, subfolder)?;
+                (files.tokenizer, files.model, files.config)
+            }
+            #[cfg(feature = "local-only")]
+            {
+                return Err(anyhow!(
+                    "remote model downloads are disabled by the `local-only` feature; pass a local model directory instead"
+                ));
+            }
+            #[cfg(all(not(feature = "hf-hub"), not(feature = "local-only")))]
+            {
+                return Err(anyhow!(
+                    "remote model downloads require the `hf-hub` feature; pass a local model directory instead"
+                ));
+            }
+        }
+    };
+
+    Ok(ModelFiles {
+        tokenizer,
+        model,
+        config,
+    })
+}
+
+#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
+fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&str>) -> Result<ModelFiles> {
+    let previous = token.and_then(|_| env::var_os("HF_HUB_TOKEN"));
+    if let Some(tok) = token {
+        env::set_var("HF_HUB_TOKEN", tok);
+    }
+
+    let result = (|| {
+        let mut api_builder = ApiBuilder::from_env();
+        if let Some(cache_dir) = env::var_os("HF_HUB_CACHE") {
+            api_builder = api_builder.with_cache_dir(PathBuf::from(cache_dir));
+        }
+        let api = api_builder.build().context("hf-hub API init failed")?;
+        let repo = api.model(repo_id.to_owned());
+        let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+        Ok(ModelFiles {
+            tokenizer: repo.get(&format!("{prefix}tokenizer.json"))?,
+            model: repo.get(&format!("{prefix}model.safetensors"))?,
+            config: repo.get(&format!("{prefix}config.json"))?,
+        })
+    })();
+
+    if token.is_some() {
+        if let Some(value) = previous {
+            env::set_var("HF_HUB_TOKEN", value);
+        } else {
+            env::remove_var("HF_HUB_TOKEN");
+        }
+    }
+
+    result
 }
