@@ -98,6 +98,26 @@ fn test_from_borrowed() {
     assert!(!emb.is_empty());
 }
 
+/// Some sentence-transformers exports don't ship a config.json at all.
+/// `from_pretrained` must still load the model, defaulting normalize=true,
+/// instead of failing because config.json is missing.
+#[test]
+fn test_from_pretrained_without_config_json() {
+    let source = "tests/fixtures/test-model-float32";
+    let dir = std::env::temp_dir().join(format!("model2vec-rs-test-no-config-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(format!("{source}/tokenizer.json"), dir.join("tokenizer.json")).unwrap();
+    fs::copy(format!("{source}/model.safetensors"), dir.join("model.safetensors")).unwrap();
+    // Deliberately no config.json in `dir`.
+
+    let model = StaticModel::from_pretrained(&dir, None, None, None)
+        .expect("loading a model with no config.json should succeed, defaulting normalize=true");
+    let emb = model.encode_single("hello world");
+    assert!(!emb.is_empty());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn test_from_bytes_matches_from_pretrained_for_local_model() {
     let path = "tests/fixtures/test-model-float32";
@@ -105,7 +125,7 @@ fn test_from_bytes_matches_from_pretrained_for_local_model() {
     let from_bytes = StaticModel::from_bytes(
         fs::read(format!("{path}/tokenizer.json")).unwrap(),
         fs::read(format!("{path}/model.safetensors")).unwrap(),
-        fs::read(format!("{path}/config.json")).unwrap(),
+        Some(fs::read(format!("{path}/config.json")).unwrap()),
         None,
     )
     .unwrap();

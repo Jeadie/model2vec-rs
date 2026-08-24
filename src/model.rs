@@ -32,7 +32,7 @@ pub struct StaticModel {
 struct ModelFiles {
     tokenizer: std::path::PathBuf,
     model: std::path::PathBuf,
-    config: std::path::PathBuf,
+    config: Option<std::path::PathBuf>,
 }
 
 impl StaticModel {
@@ -43,7 +43,7 @@ impl StaticModel {
     pub fn from_bytes<T, M, C>(
         tokenizer_bytes: T,
         model_bytes: M,
-        config_bytes: C,
+        config_bytes: Option<C>,
         normalize: Option<bool>,
     ) -> Result<Self>
     where
@@ -53,9 +53,19 @@ impl StaticModel {
     {
         let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow!("failed to load tokenizer: {e}"))?;
 
-        // Read normalize default from config.json
-        let cfg: Value = serde_json::from_slice(config_bytes.as_ref()).context("failed to parse config.json")?;
-        let cfg_norm = cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true);
+        // Read normalize default from config.json, if present. Some sentence-transformers
+        // exports don't ship a config.json at all; default to normalize=true in that case
+        // rather than failing to load.
+        let cfg_norm = match config_bytes {
+            Some(bytes) => {
+                let cfg: Value = serde_json::from_slice(bytes.as_ref()).context("failed to parse config.json")?;
+                cfg.get("normalize").and_then(Value::as_bool).unwrap_or(true)
+            }
+            None => {
+                log::warn!("config.json not found, defaulting normalize=true");
+                true
+            }
+        };
         let normalize = normalize.unwrap_or(cfg_norm);
 
         // Load the safetensors
@@ -140,7 +150,10 @@ impl StaticModel {
         let files = resolve_model_files(repo_or_path, token, subfolder)?;
         let tokenizer_bytes = fs::read(&files.tokenizer).context("failed to read tokenizer.json")?;
         let model_bytes = fs::read(&files.model).context("failed to read model.safetensors")?;
-        let config_bytes = fs::read(&files.config).context("failed to read config.json")?;
+        let config_bytes = files
+            .config
+            .map(|path| fs::read(path).context("failed to read config.json"))
+            .transpose()?;
         Self::from_bytes(tokenizer_bytes, model_bytes, config_bytes, normalize)
     }
 
@@ -421,10 +434,13 @@ fn resolve_model_files<P: AsRef<Path>>(
             let folder = subfolder.map(|s| base.join(s)).unwrap_or_else(|| base.to_path_buf());
             let tokenizer = folder.join("tokenizer.json");
             let model = folder.join("model.safetensors");
-            let config = folder.join("config.json");
-            if !tokenizer.exists() || !model.exists() || !config.exists() {
-                return Err(anyhow!("local path {folder:?} missing tokenizer / model / config"));
+            if !tokenizer.exists() || !model.exists() {
+                return Err(anyhow!(
+                    "local path {folder:?} missing tokenizer.json or model.safetensors"
+                ));
             }
+            let config = folder.join("config.json");
+            let config = config.exists().then_some(config);
             (tokenizer, model, config)
         } else {
             #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
@@ -472,7 +488,7 @@ fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&s
         Ok(ModelFiles {
             tokenizer: repo.get(&format!("{prefix}tokenizer.json"))?,
             model: repo.get(&format!("{prefix}model.safetensors"))?,
-            config: repo.get(&format!("{prefix}config.json"))?,
+            config: repo.get(&format!("{prefix}config.json")).ok(),
         })
     })();
 
