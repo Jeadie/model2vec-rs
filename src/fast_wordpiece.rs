@@ -45,7 +45,10 @@ impl FastWordPiece {
         if model.get("type")?.as_str()? != "WordPiece" {
             return None;
         }
-        if json.get("pre_tokenizer").and_then(|p| p.get("type")).and_then(|t| t.as_str())
+        if json
+            .get("pre_tokenizer")
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
             != Some("BertPreTokenizer")
         {
             return None;
@@ -56,11 +59,12 @@ impl FastWordPiece {
         }
         let lowercase = norm.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(true);
         let clean_text = norm.get("clean_text").and_then(|v| v.as_bool()).unwrap_or(true);
-        let handle_chinese_chars =
-            norm.get("handle_chinese_chars").and_then(|v| v.as_bool()).unwrap_or(true);
+        let handle_chinese_chars = norm
+            .get("handle_chinese_chars")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         // `strip_accents: null` follows the lowercase setting, matching HuggingFace.
-        let strip_accents =
-            norm.get("strip_accents").and_then(|v| v.as_bool()).unwrap_or(lowercase);
+        let strip_accents = norm.get("strip_accents").and_then(|v| v.as_bool()).unwrap_or(lowercase);
 
         // Vocab from the tokenizer (avoids re-parsing ~30k JSON entries).
         let vocab = tok.get_vocab(true);
@@ -120,9 +124,7 @@ impl FastWordPiece {
     /// exceeds `max_input_chars_per_word`) maps to a single unk token.
     fn word_to_ids(&self, word: &str, out: &mut Vec<u32>, scratch: &mut String) {
         // Rune count never exceeds byte length, so short words skip the scan.
-        if word.len() > self.max_input_chars_per_word
-            && word.chars().count() > self.max_input_chars_per_word
-        {
+        if word.len() > self.max_input_chars_per_word && word.chars().count() > self.max_input_chars_per_word {
             self.push_unk(out);
             return;
         }
@@ -386,11 +388,7 @@ mod tests {
         let ft = FastWordPiece::from_tokenizer(&tok).expect("fixture is a WordPiece pipeline");
 
         for text in corpus() {
-            let want: Vec<u32> = tok
-                .encode_fast(text, false)
-                .expect("crate encode")
-                .get_ids()
-                .to_vec();
+            let want: Vec<u32> = tok.encode_fast(text, false).expect("crate encode").get_ids().to_vec();
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
         }

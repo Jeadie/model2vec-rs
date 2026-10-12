@@ -1,22 +1,34 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use half::f16;
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
-use hf_hub::api::sync::{Api, ApiRepo};
+use hf_hub::api::sync::{Api, ApiBuilder, ApiRepo};
 use ndarray::{Array2, ArrayView2, CowArray, Ix2};
-use safetensors::{tensor::Dtype, SafeTensors};
+use safetensors::{SafeTensors, tensor::Dtype};
 use serde_json::Value;
 use std::borrow::Cow;
-#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
-use std::env;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
-use tokenizers::Tokenizer;
+use tokenizers::{
+    Tokenizer,
+    models::ModelWrapper,
+    parallelism::{MaybeParallelIterator, MaybeParallelRefIterator},
+};
 
-/// Static embedding model for Model2Vec
+use crate::fast_wordpiece::FastWordPiece;
+
+/// Static embedding model for Model2Vec.
+///
+/// Clones share immutable model state instead of copying the tokenizer and embeddings.
 #[derive(Debug, Clone)]
 pub struct StaticModel {
+    inner: Arc<StaticModelInner>,
+}
+
+#[derive(Debug)]
+struct StaticModelInner {
     tokenizer: Tokenizer,
     embeddings: CowArray<'static, f32, Ix2>,
     weights: Option<Cow<'static, [f32]>>,
@@ -26,7 +38,7 @@ pub struct StaticModel {
     unk_token_id: Option<usize>,
     /// Custom IDs-only WordPiece tokenizer; `None` for non-WordPiece
     /// pipelines, which fall back to the `tokenizers` crate.
-    fast_tok: Option<crate::fast_wordpiece::FastWordPiece>,
+    fast_tok: Option<FastWordPiece>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +46,27 @@ struct ModelFiles {
     tokenizer: PathBuf,
     model: PathBuf,
     config: PathBuf,
+}
+
+fn layout_candidates<T: Copy>(base: T, subfolder: T, parent: T) -> [(T, T, &'static str); 4] {
+    [
+        (base, base, "config.json"),
+        (base, base, "config_sentence_transformers.json"),
+        (base, subfolder, "config_sentence_transformers.json"),
+        (parent, base, "config_sentence_transformers.json"),
+    ]
+}
+
+fn decode_f32(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect()
+}
+
+fn decode_f16(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| f16::from_le_bytes(b).to_f32())
+        .collect()
 }
 
 fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) -> Option<ModelFiles> {
@@ -50,12 +83,16 @@ fn match_local_layout(config_base: &Path, model_base: &Path, config_file: &str) 
 fn decode_token_mapping(dtype: Dtype, raw: &[u8]) -> Result<Vec<usize>> {
     let mapping = match dtype {
         Dtype::I64 => raw
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()) as usize)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&b| i64::from_le_bytes(b) as usize)
             .collect(),
         Dtype::I32 => raw
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as usize)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| i32::from_le_bytes(b) as usize)
             .collect(),
         other => return Err(anyhow!("unsupported mapping dtype: {:?}", other)),
     };
@@ -101,20 +138,10 @@ fn match_hub_layout(
 }
 
 fn resolve_local_model_files(folder: &Path) -> Option<ModelFiles> {
-    match_local_layout(folder, folder, "config.json")
-        .or_else(|| match_local_layout(folder, folder, "config_sentence_transformers.json"))
-        .or_else(|| {
-            match_local_layout(
-                folder,
-                &folder.join("0_StaticEmbedding"),
-                "config_sentence_transformers.json",
-            )
-        })
-        .or_else(|| {
-            folder
-                .parent()
-                .and_then(|p| match_local_layout(p, folder, "config_sentence_transformers.json"))
-        })
+    let subfolder = folder.join("0_StaticEmbedding");
+    layout_candidates(Some(folder), Some(subfolder.as_path()), folder.parent())
+        .into_iter()
+        .find_map(|(config_base, model_base, config_file)| match_local_layout(config_base?, model_base?, config_file))
 }
 
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
@@ -126,17 +153,12 @@ fn resolve_hub_model_files(repo: &ApiRepo, prefix: &str) -> Result<ModelFiles> {
         _ => String::new(),
     };
 
-    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config.json")? {
-        return Ok(f);
+    for (config_prefix, model_prefix, config_file) in layout_candidates(prefix, sub_prefix.as_str(), parent.as_str()) {
+        if let Some(files) = match_hub_layout(repo, config_prefix, model_prefix, config_file)? {
+            return Ok(files);
+        }
     }
-    if let Some(f) = match_hub_layout(repo, prefix, prefix, "config_sentence_transformers.json")? {
-        return Ok(f);
-    }
-    if let Some(f) = match_hub_layout(repo, prefix, &sub_prefix, "config_sentence_transformers.json")? {
-        return Ok(f);
-    }
-    match_hub_layout(repo, &parent, prefix, "config_sentence_transformers.json")?
-        .ok_or_else(|| anyhow!("no valid model layout found in '{prefix}'"))
+    Err(anyhow!("no valid model layout found in '{prefix}'"))
 }
 
 impl StaticModel {
@@ -173,14 +195,8 @@ impl StaticModel {
         let [rows, cols]: [usize; 2] = tensor.shape().try_into().context("embedding tensor is not 2-D")?;
         let raw = tensor.data();
         let floats: Vec<f32> = match tensor.dtype() {
-            Dtype::F32 => raw
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect(),
-            Dtype::F16 => raw
-                .chunks_exact(2)
-                .map(|b| f16::from_le_bytes(b.try_into().unwrap()).to_f32())
-                .collect(),
+            Dtype::F32 => decode_f32(raw),
+            Dtype::F16 => decode_f16(raw),
             Dtype::I8 => raw.iter().map(|&b| f32::from(b as i8)).collect(),
             other => return Err(anyhow!("unsupported tensor dtype: {other:?}")),
         };
@@ -190,17 +206,13 @@ impl StaticModel {
                 let raw = t.data();
                 let v: Vec<f32> = match t.dtype() {
                     Dtype::F64 => raw
-                        .chunks_exact(8)
-                        .map(|b| f64::from_le_bytes(b.try_into().unwrap()) as f32)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|&b| f64::from_le_bytes(b) as f32)
                         .collect(),
-                    Dtype::F32 => raw
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                        .collect(),
-                    Dtype::F16 => raw
-                        .chunks_exact(2)
-                        .map(|b| half::f16::from_le_bytes(b.try_into().unwrap()).to_f32())
-                        .collect(),
+                    Dtype::F32 => decode_f32(raw),
+                    Dtype::F16 => decode_f16(raw),
                     other => return Err(anyhow!("unsupported weights dtype: {:?}", other)),
                 };
                 Some(v)
@@ -255,28 +267,15 @@ impl StaticModel {
         weights: Option<Vec<f32>>,
         token_mapping: Option<Vec<usize>>,
     ) -> Result<Self> {
-        if embeddings.len() != rows * cols {
-            return Err(anyhow!(
-                "embeddings length {} != rows {} * cols {}",
-                embeddings.len(),
-                rows,
-                cols
-            ));
-        }
-        let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-        let fast_tok = crate::fast_wordpiece::FastWordPiece::from_tokenizer(&tokenizer);
-        let embeddings =
-            Array2::from_shape_vec((rows, cols), embeddings).context("failed to build embeddings array")?;
-        Ok(Self {
+        Self::from_storage(
             tokenizer,
-            embeddings: CowArray::from(embeddings),
-            weights: weights.map(Cow::Owned),
-            token_mapping: token_mapping.map(Cow::Owned),
+            Cow::Owned(embeddings),
+            rows,
+            cols,
             normalize,
-            median_token_length,
-            unk_token_id,
-            fast_tok,
-        })
+            weights.map(Cow::Owned),
+            token_mapping.map(Cow::Owned),
+        )
     }
 
     /// Construct from static slices (zero-copy for embedded binary data).
@@ -289,7 +288,6 @@ impl StaticModel {
     /// * `normalize` - Whether to L2-normalize output embeddings
     /// * `weights` - Optional static per-token weights for quantized models
     /// * `token_mapping` - Optional static token ID mapping for quantized models
-    #[allow(dead_code)] // Public API for external crates
     pub fn from_borrowed(
         tokenizer: Tokenizer,
         embeddings: &'static [f32],
@@ -298,6 +296,26 @@ impl StaticModel {
         normalize: bool,
         weights: Option<&'static [f32]>,
         token_mapping: Option<&'static [usize]>,
+    ) -> Result<Self> {
+        Self::from_storage(
+            tokenizer,
+            Cow::Borrowed(embeddings),
+            rows,
+            cols,
+            normalize,
+            weights.map(Cow::Borrowed),
+            token_mapping.map(Cow::Borrowed),
+        )
+    }
+
+    fn from_storage(
+        tokenizer: Tokenizer,
+        embeddings: Cow<'static, [f32]>,
+        rows: usize,
+        cols: usize,
+        normalize: bool,
+        weights: Option<Cow<'static, [f32]>>,
+        token_mapping: Option<Cow<'static, [usize]>>,
     ) -> Result<Self> {
         if embeddings.len() != rows * cols {
             return Err(anyhow!(
@@ -308,17 +326,26 @@ impl StaticModel {
             ));
         }
         let (median_token_length, unk_token_id) = Self::compute_metadata(&tokenizer)?;
-        let fast_tok = crate::fast_wordpiece::FastWordPiece::from_tokenizer(&tokenizer);
-        let embeddings = ArrayView2::from_shape((rows, cols), embeddings).context("failed to build embeddings view")?;
+        let fast_tok = FastWordPiece::from_tokenizer(&tokenizer);
+        let embeddings = match embeddings {
+            Cow::Owned(data) => {
+                CowArray::from(Array2::from_shape_vec((rows, cols), data).context("failed to build embeddings array")?)
+            }
+            Cow::Borrowed(data) => {
+                CowArray::from(ArrayView2::from_shape((rows, cols), data).context("failed to build embeddings view")?)
+            }
+        };
         Ok(Self {
-            tokenizer,
-            embeddings: CowArray::from(embeddings),
-            weights: weights.map(Cow::Borrowed),
-            token_mapping: token_mapping.map(Cow::Borrowed),
-            normalize,
-            median_token_length,
-            unk_token_id,
-            fast_tok,
+            inner: Arc::new(StaticModelInner {
+                tokenizer,
+                embeddings,
+                weights,
+                token_mapping,
+                normalize,
+                median_token_length,
+                unk_token_id,
+                fast_tok,
+            }),
         })
     }
 
@@ -328,18 +355,22 @@ impl StaticModel {
         lens.sort_unstable();
         let median_token_length = lens.get(lens.len() / 2).copied().unwrap_or(1);
 
-        let spec: Value = serde_json::to_value(tokenizer).context("failed to serialize tokenizer")?;
-        let unk_token = spec
-            .get("model")
-            .and_then(|m| m.get("unk_token"))
-            .and_then(Value::as_str);
-        let unk_token_id = if let Some(tok) = unk_token {
-            let id = tokenizer
+        let lookup = |tok: &str| {
+            tokenizer
                 .token_to_id(tok)
-                .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))?;
-            Some(id as usize)
-        } else {
-            None
+                .map(|id| id as usize)
+                .ok_or_else(|| anyhow!("unk_token '{tok}' not found in vocabulary"))
+        };
+        let unk_token_id = match tokenizer.get_model() {
+            ModelWrapper::BPE(model) => model.unk_token.as_deref().map(lookup).transpose()?,
+            ModelWrapper::WordPiece(model) => Some(lookup(&model.unk_token)?),
+            ModelWrapper::WordLevel(model) => Some(lookup(&model.unk_token)?),
+            // `tokenizers` keeps Unigram's `unk_id` private, so read it from the serialized model.
+            ModelWrapper::Unigram(model) => serde_json::to_value(model)
+                .context("failed to serialize unigram model")?
+                .get("unk_id")
+                .and_then(Value::as_u64)
+                .map(|id| id as usize),
         };
 
         Ok((median_token_length, unk_token_id))
@@ -364,39 +395,45 @@ impl StaticModel {
         max_length: Option<usize>,
         batch_size: usize,
     ) -> Vec<Vec<f32>> {
+        let model = &self.inner;
         let mut embeddings = Vec::with_capacity(sentences.len());
         for batch in sentences.chunks(batch_size) {
             let truncated: Vec<&str> = batch
                 .iter()
                 .map(|text| {
                     max_length
-                        .map(|max_tok| Self::truncate_str(text, max_tok, self.median_token_length))
+                        .map(|max_tok| Self::truncate_str(text, max_tok, model.median_token_length))
                         .unwrap_or(text.as_str())
                 })
                 .collect();
-            for mut token_ids in self.tokenize_batch_ids(&truncated) {
-                if let Some(unk_id) = self.unk_token_id {
-                    token_ids.retain(|&id| id as usize != unk_id);
-                }
-                if let Some(max_tok) = max_length {
-                    token_ids.truncate(max_tok);
-                }
-                embeddings.push(self.pool_ids(token_ids));
-            }
+            let pooled: Vec<Vec<f32>> = self
+                .tokenize_batch_ids(&truncated)
+                .into_maybe_par_iter()
+                .map(|mut token_ids| {
+                    if let Some(unk_id) = model.unk_token_id {
+                        token_ids.retain(|&id| id as usize != unk_id);
+                    }
+                    if let Some(max_tok) = max_length {
+                        token_ids.truncate(max_tok);
+                    }
+                    self.pool_ids(token_ids)
+                })
+                .collect();
+            embeddings.extend(pooled);
         }
         embeddings
     }
 
     /// Tokenize a batch to raw ID lists (before UNK filtering / truncation).
     /// Uses the custom WordPiece tokenizer when the model matches that
-    /// pipeline; non-WordPiece pipelines (e.g. the Unigram/multilingual
-    /// model) keep the crate's tokenizer by design — see optimisations.md,
-    /// H1 scope decision.
+    /// pipeline; other pipelines (e.g. Unigram) use the `tokenizers` crate.
     fn tokenize_batch_ids(&self, texts: &[&str]) -> Vec<Vec<u32>> {
-        if let Some(ft) = &self.fast_tok {
-            return texts.iter().map(|t| ft.encode_ids(t)).collect();
+        let model = &self.inner;
+        if let Some(ft) = &model.fast_tok {
+            return texts.maybe_par_iter().map(|t| ft.encode_ids(t)).collect();
         }
-        self.tokenizer
+        model
+            .tokenizer
             .encode_batch_fast::<String>(texts.iter().map(|s| (*s).to_string()).collect(), false)
             .expect("tokenization failed")
             .into_iter()
@@ -417,49 +454,40 @@ impl StaticModel {
             .unwrap_or_default()
     }
 
-    /// Mean-pool a token-ID list into a single vector. Every id contributes
-    /// exactly one row, so the mean divisor is `ids.len()`.
+    /// Mean-pool a token-ID list into a single vector.
     fn pool_ids(&self, ids: Vec<u32>) -> Vec<f32> {
-        let dim = self.embeddings.ncols();
+        let model = &self.inner;
+        let dim = model.embeddings.ncols();
         let mut sum = vec![0.0_f32; dim];
-        self.accumulate_rows(&ids, &mut sum);
-        let denom = ids.len().max(1) as f32;
+        let mut cnt = 0usize;
+        for &id in &ids {
+            let tok = id as usize;
+            let row_idx = model
+                .token_mapping
+                .as_ref()
+                .and_then(|m| m.get(tok))
+                .copied()
+                .unwrap_or(tok);
+            let scale = model.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
+            let row = model.embeddings.row(row_idx);
+            // Summing over a slice instead of a strided row lets the loop vectorize.
+            let row = row.as_slice().expect("embedding rows are contiguous");
+            for (s, &v) in sum.iter_mut().zip(row) {
+                *s += v * scale;
+            }
+            cnt += 1;
+        }
+        let denom = cnt.max(1) as f32;
         for x in &mut sum {
             *x /= denom;
         }
-        if self.normalize {
+        if model.normalize {
             let norm = sum.iter().map(|&v| v * v).sum::<f32>().sqrt().max(1e-12);
             for x in &mut sum {
                 *x /= norm;
             }
         }
         sum
-    }
-
-    /// Accumulate embedding rows for `ids` into `sum`. Indexes the
-    /// contiguous row-major backing slice directly rather than `ndarray`'s
-    /// row view, which blocks autovectorization (see optimisations.md, H4).
-    #[inline]
-    fn accumulate_rows(&self, ids: &[u32], sum: &mut [f32]) {
-        let dim = sum.len();
-        let flat = self
-            .embeddings
-            .as_slice()
-            .expect("embeddings must be contiguous row-major");
-        for &id in ids {
-            let tok = id as usize;
-            let row_idx = self
-                .token_mapping
-                .as_ref()
-                .and_then(|m| m.get(tok))
-                .copied()
-                .unwrap_or(tok);
-            let scale = self.weights.as_ref().and_then(|w| w.get(tok)).copied().unwrap_or(1.0);
-            let row = &flat[row_idx * dim..row_idx * dim + dim];
-            for (s, &v) in sum.iter_mut().zip(row.iter()) {
-                *s += v * scale;
-            }
-        }
     }
 }
 
@@ -503,28 +531,14 @@ fn resolve_model_files<P: AsRef<Path>>(
 
 #[cfg(all(feature = "hf-hub", not(feature = "local-only")))]
 fn download_model_files(repo_id: &str, token: Option<&str>, subfolder: Option<&str>) -> Result<ModelFiles> {
-    let previous = token.and_then(|_| env::var_os("HF_HUB_TOKEN"));
-    if let Some(tok) = token {
-        env::set_var("HF_HUB_TOKEN", tok);
+    let api = match token {
+        Some(token) => ApiBuilder::new().with_token(Some(token.to_owned())).build(),
+        None => Api::new(),
     }
-
-    let result = (|| {
-        let api = Api::new().context("hf-hub API init failed")?;
-        let repo = api.model(repo_id.to_owned());
-        let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
-        resolve_hub_model_files(&repo, &prefix)
-            .with_context(|| format!("could not load '{repo_id}' from HuggingFace Hub"))
-    })();
-
-    if token.is_some() {
-        if let Some(value) = previous {
-            env::set_var("HF_HUB_TOKEN", value);
-        } else {
-            env::remove_var("HF_HUB_TOKEN");
-        }
-    }
-
-    result
+    .context("hf-hub API init failed")?;
+    let repo = api.model(repo_id.to_owned());
+    let prefix = subfolder.map(|s| format!("{s}/")).unwrap_or_default();
+    resolve_hub_model_files(&repo, &prefix).with_context(|| format!("could not load '{repo_id}' from HuggingFace Hub"))
 }
 
 #[cfg(test)]

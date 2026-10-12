@@ -170,8 +170,10 @@ fn test_from_borrowed() {
     let [rows, cols]: [usize; 2] = tensor.shape().try_into().unwrap();
     let floats: Vec<f32> = tensor
         .data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
         .collect();
 
     // Leak to get 'static lifetime (fine for tests)
@@ -225,4 +227,17 @@ fn test_from_pretrained_remote_disallowed_by_local_only_feature() {
         err.to_string().contains("local-only"),
         "expected remote loading with local-only to mention the local-only restriction"
     );
+}
+
+/// Unigram tokenizers store `unk_id` instead of `unk_token`; the unknown token must still be dropped.
+#[test]
+fn test_unigram_unknown_token_is_not_pooled() {
+    use tokenizers::{Tokenizer, models::unigram::Unigram};
+
+    let vocab = [("<unk>", 0.0), ("a", -1.0), ("b", -1.0)];
+    let unigram = Unigram::from(vocab.map(|(t, s)| (t.to_string(), s)).to_vec(), Some(0), false).unwrap();
+    let embeddings = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    let model = StaticModel::from_owned(Tokenizer::new(unigram), embeddings, 3, 2, false, None, None).unwrap();
+
+    assert_eq!(model.encode_single("axb"), model.encode_single("ab"));
 }

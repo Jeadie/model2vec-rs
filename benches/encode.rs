@@ -27,8 +27,8 @@ fn main() {
         .unwrap_or_else(|| "minishlab/potion-base-2M".to_string());
 
     let cache = cache_dir();
-    let text = fs::read_to_string(format!("{cache}/big.txt"))
-        .expect("big.txt not found in cache; run the Go benchmark first");
+    let text =
+        fs::read_to_string(format!("{cache}/big.txt")).expect("big.txt not found in cache; run the Go benchmark first");
     let words: Vec<&str> = text.split_whitespace().collect();
     let chunks: Vec<String> = words.chunks(256).map(|c| c.join(" ")).collect();
     let total_bytes: usize = chunks.iter().map(|c| c.len()).sum();
@@ -87,10 +87,10 @@ fn best_mbps(reps: usize, total_bytes: usize, mut work: impl FnMut()) -> f64 {
 // cache_dir mirrors go-potion's resolveCacheDir: GO_POTION_HOME, then the
 // platform user cache directory.
 fn cache_dir() -> String {
-    if let Ok(dir) = env::var("GO_POTION_HOME") {
-        if !dir.is_empty() {
-            return dir;
-        }
+    if let Ok(dir) = env::var("GO_POTION_HOME")
+        && !dir.is_empty()
+    {
+        return dir;
     }
     if cfg!(target_os = "macos") {
         let home = env::var("HOME").expect("HOME not set");
@@ -100,10 +100,10 @@ fn cache_dir() -> String {
         let local = env::var("LOCALAPPDATA").expect("LOCALAPPDATA not set");
         return format!("{local}\\go-potion");
     }
-    if let Ok(xdg) = env::var("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
-            return format!("{xdg}/go-potion");
-        }
+    if let Ok(xdg) = env::var("XDG_CACHE_HOME")
+        && !xdg.is_empty()
+    {
+        return format!("{xdg}/go-potion");
     }
     let home = env::var("HOME").expect("HOME not set");
     format!("{home}/.cache/go-potion")
