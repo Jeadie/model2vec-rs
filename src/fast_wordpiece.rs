@@ -1,4 +1,4 @@
-//! H1: a purpose-built, IDs-only WordPiece tokenizer (optimisations.md).
+//! A purpose-built, IDs-only WordPiece tokenizer.
 //!
 //! `encode_batch_fast` builds full `Encoding` objects (offsets, alignment,
 //! masks, type IDs) of which the static-embedding path uses only `get_ids()`.
@@ -7,9 +7,12 @@
 //! non-multilingual POTION model, producing token IDs identical to the
 //! `tokenizers` crate (verified by the parity test below).
 //!
-//! It is a Rust port of the verified go-potion implementation. Non-WordPiece
-//! pipelines (e.g. the SentencePiece-Unigram multilingual model) return `None`
-//! from [`FastWordPiece::from_tokenizer`] so the caller falls back to the crate.
+//! Literal added-token text (e.g. `[MASK]`, `[CLS]`) is matched and resolved
+//! to its id before normalization, matching the crate's `AddedVocabulary`
+//! step. Pipelines this module does not reproduce exactly (e.g. the
+//! SentencePiece-Unigram multilingual model, or added tokens with
+//! `normalized`/`single_word`/`lstrip`/`rstrip` set) return `None` from
+//! [`FastWordPiece::from_tokenizer`] so the caller falls back to the crate.
 
 use std::collections::HashMap;
 
@@ -32,6 +35,13 @@ pub(crate) struct FastWordPiece {
     handle_chinese_chars: bool,
     strip_accents: bool,
     lowercase: bool,
+    /// Added tokens matched as literal substrings of the raw text before
+    /// normalization, longest content first so a shorter token cannot shadow
+    /// a longer one with the same prefix.
+    added_tokens: Vec<(String, u32)>,
+    /// First byte of every added token, so the scan skips byte positions
+    /// that cannot start a match with one array lookup.
+    added_token_first_bytes: [bool; 256],
 }
 
 impl FastWordPiece {
@@ -80,6 +90,21 @@ impl FastWordPiece {
             .and_then(|v| v.as_u64())
             .unwrap_or(100) as usize;
 
+        // The crate matches added tokens with `normalized: false` against raw
+        // text; the other flags change matching rules not implemented here.
+        let mut added_tokens = Vec::new();
+        for (id, t) in tok.get_added_tokens_decoder() {
+            if t.content.is_empty() || t.normalized || t.single_word || t.lstrip || t.rstrip {
+                return None;
+            }
+            added_tokens.push((t.content, id));
+        }
+        added_tokens.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        let mut added_token_first_bytes = [false; 256];
+        for (content, _) in &added_tokens {
+            added_token_first_bytes[content.as_bytes()[0] as usize] = true;
+        }
+
         let mut single_byte = [-1_i32; 128];
         for (b, slot) in single_byte.iter_mut().enumerate() {
             if let Some(&id) = vocab.get(&(b as u8 as char).to_string()) {
@@ -97,19 +122,54 @@ impl FastWordPiece {
             handle_chinese_chars,
             strip_accents,
             lowercase,
+            added_tokens,
+            added_token_first_bytes,
         })
     }
 
     /// Encode text into token IDs, matching `encode_batch_fast(...).get_ids()`
     /// (unknown words emit the unk id, which the caller filters out).
     pub(crate) fn encode_ids(&self, text: &str) -> Vec<u32> {
-        let normalized = self.normalize(text);
         let mut out = Vec::new();
         let mut scratch = String::new();
-        for word in pre_tokenize(&normalized) {
-            self.word_to_ids(word, &mut out, &mut scratch);
+        // Split on added tokens (leftmost-longest), then run the BERT
+        // pipeline on each span of ordinary text between them.
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let hit = self.added_token_first_bytes[bytes[i] as usize]
+                .then(|| {
+                    self.added_tokens
+                        .iter()
+                        .find(|(content, _)| text[i..].starts_with(content.as_str()))
+                })
+                .flatten();
+            match hit {
+                Some((content, id)) => {
+                    self.encode_span(&text[start..i], &mut out, &mut scratch);
+                    out.push(*id);
+                    i += content.len();
+                    start = i;
+                }
+                // Added tokens are valid UTF-8, so a match can only start on
+                // a char boundary; step a whole char to keep slicing valid.
+                None => i += text[i..].chars().next().map_or(1, char::len_utf8),
+            }
         }
+        self.encode_span(&text[start..], &mut out, &mut scratch);
         out
+    }
+
+    /// Normalize, pre-tokenize and WordPiece a span with no added tokens.
+    fn encode_span(&self, span: &str, out: &mut Vec<u32>, scratch: &mut String) {
+        if span.is_empty() {
+            return;
+        }
+        let normalized = self.normalize(span);
+        for word in pre_tokenize(&normalized) {
+            self.word_to_ids(word, out, scratch);
+        }
     }
 
     // --- WordPiece ---------------------------------------------------------
@@ -375,6 +435,61 @@ mod tests {
             "",
             "   ",
             "MiXeD CaSe WoRdS 42",
+            // --- clean_text: control/format chars removed, whitespace→space ---
+            "a\u{0007}b\u{0000}c",      // bell + NUL removed
+            "a\u{000b}b\u{000c}c",      // vertical tab / form feed (Cc → removed, NOT spaced)
+            "a\u{007f}b",               // DEL removed
+            "a\u{200b}b\u{feff}c",      // zero-width space + BOM (Cf → removed)
+            "a\u{00a0}b\u{2009}c",      // NBSP + thin space (Zs → become space → split)
+            "a\u{fffd}b",               // replacement char removed
+            "\u{0001}\u{0002}\u{0003}", // all-control → empty after normalize
+            "  leading and trailing  ", // edge whitespace trim
+            "\t\n\r",                   // whitespace/control only
+            // --- casing that changes length or is context-sensitive ---
+            "İstanbul",                  // U+0130: NFD→I+dot, strip dot, lower→i
+            "STRASSE straße GROSS",      // eszett upper/lower asymmetry
+            "ﬁle ﬀ ﬄ",                   // ligatures (fi, ff, ffl)
+            "ΟΔΟΣ Σίσυφος",              // Greek final-sigma: verify char-level (no context)
+            "ＦＵＬＬＷＩＤＴＨ ａｂｃ", // fullwidth latin casing
+            // --- accents / combining marks, both compositions ---
+            "e\u{0301} a\u{0300} n\u{0303}", // pre-decomposed base+combining
+            "é à ñ ü ç",                     // precomposed (NFD path)
+            "Å Ω µ",                         // chars with compatibility/canonical quirks
+            "क्षत्रि",                         // Devanagari combining (non-Latin marks)
+            // --- CJK / handle_chinese_chars boundaries and non-CJK scripts ---
+            "一鿿㐀䶿",                       // BMP CJK range endpoints
+            "𠀀 𪛖 豈",                       // ext-B (U+20000) + compatibility (U+F900)
+            "你好world世界",                  // CJK adjacent to latin, no spaces
+            "，。、！？；：",                 // fullwidth/CJK punctuation (category Po → isolate)
+            "こんにちは カタカナ 안녕하세요", // kana + hangul: must NOT be space-wrapped
+            // --- punctuation isolation: ASCII vs Unicode P vs Unicode symbol ---
+            "a≤b x→y n≠m", // Sm math symbols: NOT punctuation → stay in word
+            "«guillemets» \u{201c}smart\u{201d} \u{2018}quotes\u{2019}", // Pi/Pf → isolate
+            "em—dash en–dash …ellipsis", // Pd + Po
+            "e.g., i.e. U.S.A. 3.14 1,000", // dotted abbreviations / decimals
+            "!!!??? ((())) [a]{b}", // punctuation runs / adjacency
+            "$100 €50 £20 ¥30 ₹40 ₿1", // currency symbols (Sc)
+            // --- emoji / symbols / combining sequences ---
+            "hello 👋 world 🌍",
+            "family 👨‍👩‍👧 ZWJ",      // ZWJ sequence (ZWJ is Cf → removed)
+            "🇺🇸 🇯🇵 flags",        // regional indicators
+            "thumbs 👍🏽 skintone", // emoji + skin-tone modifier
+            // --- WordPiece internals: subwords, unk, max_input_chars ---
+            "internationalization preprocessing tokenization playing", // multi-## splits
+            "ᚠᚢᚦ 𐐀𐐁 zzqxjk",                                           // runic/deseret/rare → unk path
+            "🎉party mixed🔥emoji",                                    // unk char glued to word
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 100 chars: at boundary
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 101 chars: exceeds → unk
+            "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字", // long multibyte: byte-len ≫ char-len (exercises the byte shortcut)
+            // --- literal special/added tokens ---
+            "hello [MASK] world",
+            "hello [mask] world",
+            "[CLS] hi [SEP]",
+            "[PAD][UNK][MASK]",
+            "no special tokens here",
+            "[MASK] [CLS] [SEP] [PAD] [UNK]",
+            "foo[SEP]bar text[MASK]here",
+            "[unk] lowercase specials", // normalized-form collision check
         ]
     }
 
@@ -392,5 +507,16 @@ mod tests {
             let got = ft.encode_ids(text);
             assert_eq!(got, want, "token-id mismatch for {text:?}");
         }
+    }
+
+    #[test]
+    fn normalized_added_token_falls_back() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/test-model-int8/tokenizer.json"
+        );
+        let mut tok = Tokenizer::from_file(path).expect("load fixture tokenizer");
+        tok.add_tokens(&[tokenizers::AddedToken::from("hello world", false)]);
+        assert!(FastWordPiece::from_tokenizer(&tok).is_none());
     }
 }
